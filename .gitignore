@@ -1,0 +1,9 @@
+.venv/
+env/
+__pycache__/
+Lib/
+Include/
+Scripts/
+Share/
+models-checkpoints/
+pyvenv.cfg
