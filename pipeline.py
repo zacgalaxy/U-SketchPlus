@@ -16,41 +16,57 @@ from PIL import Image, ImageStat
 from functools import reduce
 
 
+"torch.no_grad is in the other file due to it being used in infrance and evalution"
 def hook_unet(unet):
+    #Hooked to be used during infrneces and are queried for there activation during inference
+    #does not chnage when reversing the model 
     blocks_idx = [0, 1, 2]
     feature_blocks = []
     def hook(module, input, output):
         if isinstance(output, tuple):
-            output = output[0]
+            output = output[0]# output is a tuple, get the first element
         
-        if isinstance(output, torch.TensorType):
+        if isinstance(output, torch.TensorType): # output is a tensor convert to float data type and stores it as new attribute output in current module
             feature = output.float()
-            setattr(module, "output", feature)
+            setattr(module, "output", feature) # dynamiclly attached output as attribute to the module makingis accepble for debugging or querying
         elif isinstance(output, dict): 
-            feature = output.sample.float()
-            setattr(module, "output", feature)
+            feature = output.sample.float() # sample filed converted to float data type
+            setattr(module, "output", feature) # due to outputs usally being dictonaris
         else: 
-            feature = output.float()
+            feature = output.float() # output is a tensor convert to float data type in case prior fuctions didnt work 
             setattr(module, "output", feature)
     
-    # 0, 1, 2 -> (ldm-down) 2, 4, 8
+    
+    # these blocks are fundemental to U net architecture
+    
+    # down block, extract featuers and progressivly reduce spatial dimensions (down smapling) 
+    # goes thriugh convalutional block, activation layer and max pooling in the  pipeline
+    #outputs a feature map with lower dimention but more featuers
+    
+    # 0, 1, 2 -> (ldm-down) 2, 4, 8 [ translates to for example ldm down 0 downsmapled by factor of 2]
     for idx, block in enumerate(unet.down_blocks):
         if idx in blocks_idx:
             block.register_forward_hook(hook)
             feature_blocks.append(block) 
-            
-    # ldm-mid 0, 1, 2
-    for block in unet.mid_block.attentions + unet.mid_block.resnets:
+    
+    # mid block, Operates on the smallest spatial resolution in the network, capturing the most abstract and high-level features.
+    # seris of convolutional layers without down sampling 
+    # has attention mechanism to capture long-range dependencies
+    # ldm-mid 0, 1, 2 [ no factors here as dimensions stay constant]
+    for block in unet.mid_block.attentions + unet.mid_block.resnets: #mid block, 
         block.register_forward_hook(hook)
         feature_blocks.append(block) 
     
-    # 0, 1, 2 -> (ldm-up) 2, 4, 8
+    #up block,  Reconstruct the spatial resolution by progressively increasing the dimensions (up-sampling).
+    # up sampling of layers using convtranspose, skip connections and convolutional layers
+    # 0, 1, 2 -> (ldm-up) 2, 4, 8 [ translates to for example ldm up 0 upsmapled by factor of 2]
     for idx, block in enumerate(unet.up_blocks):
         if idx in blocks_idx:
             block.register_forward_hook(hook)
             feature_blocks.append(block)  
             
     return feature_blocks
+    
     
 
 class SketchGuidedText2Image():
@@ -178,18 +194,19 @@ class SketchGuidedText2Image():
         immean = 0.9664114577640158
         imstd = 0.0858381272736797
         
-        data = pil_image.convert('L')
+        data = pil_image.convert('L') # input grey scale converstion
         w, h = data.size[0], data.size[1]
-        pw = 8 - (w % 8) if w % 8 != 0 else 0
-        ph = 8 - (h % 8) if h % 8 != 0 else 0
-        stat = ImageStat.Stat(data)
+        pw = 8 - (w % 8) if w % 8 != 0 else 0 # padding width 
+        ph = 8 - (h % 8) if h % 8 != 0 else 0 # padding height
+        stat = ImageStat.Stat(data)  # image statistics
 
-        data = ((transforms.ToTensor()(data) - immean) / imstd).unsqueeze(0)
-        if pw != 0 or ph != 0:
+        data = ((transforms.ToTensor()(data) - immean) / imstd).unsqueeze(0) # nomalized using mean and standerd devation
+        if pw != 0 or ph != 0: #replication of padding thats applied if needed
             data = torch.nn.ReplicationPad2d((0, pw, 0, ph))(data).data
-        pred = self.sketch_simplifier(data.cuda()).float()
+        pred = self.sketch_simplifier(data.cuda()).float() # is the sketch simplifer model
         pred_array = pred.detach().cpu().numpy()[0,0]     
-        return Image.fromarray((pred_array*255).astype("uint8")).convert("RGB")
+        return Image.fromarray((pred_array*255).astype("uint8")).convert("RGB") # the t lines are converting it back to a image, result is simple sketch in RBG format
+ 
 
     @torch.no_grad()
     def prepare_edge_maps(self, prompt, num_images_per_prompt, edge_maps):
@@ -204,38 +221,43 @@ class SketchGuidedText2Image():
         return encoded_edge_maps_tensor
 
     @torch.no_grad()
-    def text_to_embeddings(self, text):
-
+    def text_to_embeddings(self, text): 
+        #padding to max length nensures sequnces are equal, truncation ensures that the sequnce is not too long, return_tensors ensures that the output is a tensor
         tokenized_text = self.tokenizer(text, padding = "max_length", max_length = self.tokenizer.model_max_length, truncation = True, return_tensors = "pt")
 
         with torch.no_grad(): 
-            text_embeddings = text_encoder(
+            text_embeddings = text_encoder(                 #text encoder is used to encode the text
                 tokenized_text.input_ids.to(self.device)
-            )[0].half()
+            )[0].half()                                     # converts half embeddings to half precision for faster computation
         return text_embeddings
     
     def get_noise_level(self, noise, timesteps):
-        sqrt_one_minus_alpha_prod = (1 - self.scheduler.alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+        # self.scheduler.aples_cumpord is a sequnces of cumulative product values for the diffusian model, which represnts how much information is lost at each timestep
+        # 1-alphas_cumprod represnts the noise 
+        #the standerd devation of the noise is the square root of the noise
+        sqrt_one_minus_alpha_prod = (1 - self.scheduler.alphas_cumprod[timesteps]) ** 0.5         
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()     # 1d array for easier manipulation
         
-        while len(sqrt_one_minus_alpha_prod.shape) < len(noise.shape):
+        while len(sqrt_one_minus_alpha_prod.shape) < len(noise.shape):      # expand the shape of the noise to match the shape of the noise
             sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
             
-        noise_level = sqrt_one_minus_alpha_prod.to(self.device) * noise
+        noise_level = sqrt_one_minus_alpha_prod.to(self.device) * noise     # noise level is the square root of the noise
         return noise_level
 
     @torch.no_grad()
     def image_to_latents(self, img, img_type):
-      np_img = (np.array(img).astype(np.float32) / 255.0) 
-      if img_type == "edge_map":
-            np_img[np_img < 0.5] = 0.
+      np_img = (np.array(img).astype(np.float32) / 255.0)  # convert image to numpy array and normalize it
+      if img_type == "edge_map": # optional step for edge maps, simpling structer
+            np_img[np_img < 0.5] = 0. 
             np_img[np_img >= 0.5] = 1.
-      np_img = np_img* 2.0 - 1.0
-      np_img = np_img[None].transpose(0, 3, 1, 2)
-      torch_img = torch.from_numpy(np_img)
+      np_img = np_img* 2.0 - 1.0 # convert image to range [-1, 1]
+      np_img = np_img[None].transpose(0, 3, 1, 2) # convert image to NCHW  format, adding a batch dimnesion (None, 0 ) to makes ((Height,Width,Channels)→(Batch,Channels,Height,Width))
+      torch_img = torch.from_numpy(np_img) # convertd to torch foor VAE encoding
       generator = torch.Generator(self.device).manual_seed(0)
+      #self.vae.encode compress image into a latent distribution
+      #latent_dist.sample samples from the latent distribution from dista using a seed
       latents = self.vae.encode(torch_img.to( self.vae.dtype).to(self.device)).latent_dist.sample(generator=generator)
-      latents = latents * 0.18215
+      latents = latents * 0.18215 # scaling factor to standerdise the range o latent values
       return latents
 
     @torch.no_grad()
@@ -243,13 +265,16 @@ class SketchGuidedText2Image():
         '''
         Function to convert latents to images
         '''
-        latents = (1 / 0.18215) * latents
+        latents = (1 / 0.18215) * latents # rescale latents values
+        #self.vae.decode(latents) tranms it into image tensor 
+        #sample ecracts pixel-space image from the output
         with torch.no_grad():
-            image = self.vae.decode(latents).sample
+            image = self.vae.decode(latents).sample # decode latents to image
 
-        image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
-        images = (image * 255).round().astype("uint8")
-        pil_images = [Image.fromarray(image) for image in images]
+        image = (image / 2 + 0.5).clamp(0, 1) # normalize image to [0, 1]
+        image = image.detach().cpu().permute(0, 2, 3, 1).numpy() # convert image to NHWC format, (Batch,Channels,Height,Width)→(Batch,Height,Width,Channels)
+        images = (image * 255).round().astype("uint8") # convert pixel values from [0,1] to [0,255]
+        pil_images = [Image.fromarray(image) for image in images] # convert images to PIL format
+
         return pil_images
 
