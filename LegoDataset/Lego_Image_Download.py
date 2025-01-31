@@ -4,7 +4,7 @@ import pandas as pd
 
 # Load the spreadsheet (replace 'your_spreadsheet.csv' with your file name)
 spreadsheet_file = "lego_sets_and_themes.csv"  # Replace with your file name
-output_directory = os.path.join(os.path.dirname(os.path.abspath(spreadsheet_file)), "images1 (random)")
+output_directory = os.path.join(os.path.dirname(os.path.abspath(spreadsheet_file)), "images 4 (Flowers)")
 
 # Create the output directory if it doesn't exist
 os.makedirs(output_directory, exist_ok=True)
@@ -17,7 +17,7 @@ required_columns = ['set_number', 'set_name', 'year_released', 'number_of_parts'
 if not all(column in df.columns for column in required_columns):
     raise ValueError(f"The spreadsheet must contain the following columns: {', '.join(required_columns)}")
 intrested_theme= ['Archtiecture', 'Skylines' , 'pick A model' , 'Creator 3-in-1']
-
+nature=["flowers","botanical"]
 
 # Open the file and read its contents into a list
 objects_to_test_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'objectstotest.txt')
@@ -27,6 +27,7 @@ with open(objects_to_test_file, 'r') as file:
         # Split lines containing underscores into separate words and normalize
         words = line.strip().replace("_", " ").split()
         objectstotest.extend(word.lower() for word in words)
+
 
 
 # Normalize strings for comparison
@@ -100,7 +101,8 @@ for index, row in df.iterrows():
     setnname= normalize_string(file_name)
     
     #if pd.notna(url) and pd.notna(file_name) and year > 2020 and any(obj in setnname for obj in objectstotest):
-    if pd.notna(url) and pd.notna(file_name) and normalized_theme in normalized_interested_theme:  # Filter by year and theme
+    #if pd.notna(url) and pd.notna(file_name) and normalized_theme in normalized_interested_theme:  # Filter by year and theme
+    if pd.notna(url) and pd.notna(file_name) and any(obj in setnname for obj in nature):
         sanitized_file_name = file_name.replace("/", "-").replace("\\", "-")  # Avoid invalid characters
         download_image(sanitized_file_name, url ,theme, output_directory)
 
