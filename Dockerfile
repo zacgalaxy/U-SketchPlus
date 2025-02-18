@@ -23,12 +23,15 @@ RUN pip3 install --upgrade pip
 # Install Python dependencies for CLIPasso
 WORKDIR /workspace/clipasso
 RUN pip3 install --no-cache-dir -r requirements.txt ipywidgets protobuf==3.20.*
-RUN pip3 pip uninstall torch torchvision torchaudio -y
-RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+RUN pip3 uninstall torch torchvision torchaudio -y
+RUN pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 
 # Install diffvg
-WORKDIR /workspace/diffvg
+WORKDIR /workspace
+RUN rm -rf diffvg
+RUN pip3 uninstall -y pydiffvg
+RUN git clone --recursive https://github.com/BachiLi/diffvg.git /workspace/diffvg
 RUN git submodule update --init --recursive
 RUN python3 setup.py install
 
