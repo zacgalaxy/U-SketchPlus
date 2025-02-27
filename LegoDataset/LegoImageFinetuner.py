@@ -10,8 +10,8 @@ import cv2
 import matplotlib.pyplot as plt
 import os 
 
-inputroot="images_4_(Flowers)"
-outputroot="Image_4_256x256"
+inputroot="./Lego_og_size_cleaned"
+outputroot="./Lego_256x256/photos"
 
 new_w=256
 new_h=256

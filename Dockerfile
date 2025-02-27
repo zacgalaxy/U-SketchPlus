@@ -32,6 +32,7 @@ WORKDIR /workspace
 RUN rm -rf diffvg
 RUN pip3 uninstall -y pydiffvg
 RUN git clone --recursive https://github.com/BachiLi/diffvg.git /workspace/diffvg
+WORKDIR /workspace/diffvg
 RUN git submodule update --init --recursive
 RUN python3 setup.py install
 
