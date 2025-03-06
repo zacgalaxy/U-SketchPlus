@@ -218,10 +218,10 @@ class SketchGuidedText2ImageTrainer():
             latents_old = unet_input.chunk(2)[1]
             latents = self.scheduler.step(pred, timestep, latents).prev_sample
             
-            print("unet_input norm:", torch.linalg.norm(unet_input).item())
-            print("latents_old norm:", torch.linalg.norm(latents_old).item())
-            print("latents norm:", torch.linalg.norm(latents).item())
-            print("Encoded edge maps norm:", torch.linalg.norm(encoded_edge_maps.float()).item())
+            #print("unet_input norm:", torch.linalg.norm(unet_input).item())
+            #print("latents_old norm:", torch.linalg.norm(latents_old).item())
+            #print("latents norm:", torch.linalg.norm(latents).item())
+            #print("Encoded edge maps norm:", torch.linalg.norm(encoded_edge_maps.float()).item())
             
             # Guidance branch.
             with current_gradient_state:
@@ -231,6 +231,7 @@ class SketchGuidedText2ImageTrainer():
                     outputs = block.output  # Use the hook outputs as stored
                     resized = F.interpolate(outputs, size=fixed_size, mode="bilinear")
                     intermediate_result.append(resized)
+                    del block.output
                     # Do not clear the outputs so that the UNet's internal structure is not affected.
                 intermediate_result = torch.cat(intermediate_result, dim=1).to(self.device)
                 
@@ -247,17 +248,18 @@ class SketchGuidedText2ImageTrainer():
                 if gradient:
                     similarity = torch.linalg.norm(result - encoded_edge_maps)**2
                     # Compute gradients from the similarity.
-                    _, grad = torch.autograd.grad(similarity, unet_input)[0].chunk(2)
-                    alpha = (torch.linalg.norm(latents_old - latents) / torch.linalg.norm(grad)) * sketch_guidance_strength
+                    _, grad = torch.autograd.grad(similarity, unet_input, retain_graph=True)[0].chunk(2)
+                    grad_norm = torch.linalg.norm(grad)
+                    grad_clamp = torch.clamp(grad, -1.0, 1.0)  # or use clip_grad_norm_
+                    alpha = (torch.linalg.norm(latents_old - latents) / (grad_norm + 1e-8)) * sketch_guidance_strength
+                    latents = latents - alpha * grad_clamp
                     print(f"Step {i} | timestep: {timestep} | alpha: {alpha.item():.4f}")
-                    latents = latents - alpha * grad
             
             gc.collect()
             torch.cuda.empty_cache()
         
-        # 5. Compute final MSE loss.
-        with torch.no_grad():
-            loss = F.mse_loss(latents, gt_latents)
+        # 5. Compute final MSE loss.    
+        loss = F.mse_loss(latents, gt_latents)
         return loss
                                     
     
