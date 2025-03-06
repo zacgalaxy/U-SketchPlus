@@ -14,6 +14,10 @@ from torchvision.transforms import v2
 from albumentations.pytorch import ToTensorV2
 from PIL import Image, ImageStat
 from functools import reduce
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from tqdm.auto import tqdm
 
 
 "torch.no_grad is in the other file due to it being used in infrance and evalution"
