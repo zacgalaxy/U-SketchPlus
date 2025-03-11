@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 import random 
 import math
-import tqdm
+from tqdm import tqdm
 import gc
 import matplotlib.pyplot as plt
 

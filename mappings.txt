@@ -1,0 +1,43 @@
+Bridge-2: Red Rope Bridge
+Bridge: London Bridge
+Buggy: Blue and yellow Buggy
+Car-1: Blue car
+Car-2: Yellow Land Rover
+Car-3: Green sports car 
+Car-4: Yellow Land Rover
+Cat: Black and white cat
+Conservatory: White flower conservatory
+Cottage: blue and red Cottage
+Crocodile: Crocodile
+Deli: Deli
+Dog: German Shepard 
+Ferris_Wheel: Ferris Wheel
+Flowers-2: Pink orange and yellow flower
+Flowers: White and yellow flower
+Forklift: Forklift
+Helicopter-1: Red and Yellow Helicopter
+Helicopter-2: Blue Helicopter
+High-Speed Train: High speed Train
+House-1: Blue and white House
+House-2: Black and Yellow House
+House-3: Red and white House
+Lion: Lion
+MotorBike: Green MotorBike
+Motorcycle: Red Motorcycle
+Panda: Panda
+Parrot: Parrot
+Penguin: Penguin
+Pirate_Ship: Pirate Ship
+Plane: Orange Plane
+Pug: Pug
+Rabbit: Rabbit
+Race_Car: Red Race car
+Ship: Ship
+Skull: Skull with inversed to 
+Space_Ship: Space Ship
+Space_Ship2: Space ship 
+Taxi: Yellow Taxi
+Tree: tree
+Van: Yellow Van
+Vespa: Red Vespa
+Viking_Ship: Viking Ship

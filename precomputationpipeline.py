@@ -148,66 +148,38 @@ class SketchGuidedText2ImageTrainer():
 
         # Hook UNet layers to extract intermediate features.
         self.feature_blocks = hook_unet(self.unet)
-    def train_step(self, images, sketches, text_prompts, optimizer, noise_scheduler, 
+    def train_step(self, batch, optimizer, noise_scheduler, 
                   num_inference_timesteps, classifier_guidance_strength=8, 
-                  sketch_guidance_strength=0.5, guidance_steps_perc=0.5):
-        " the guideance steps perc was 0.5"
-        " the sketch_guidance_strength step was  perc to 1.8"
-        
+                  sketch_guidance_strength=1, guidance_steps_perc=1):
         """
-        This training step follows the original inference guidance:
-          1. Encode ground-truth images into latents via the frozen VAE.
-          2. Compute text embeddings.
-          3. Add noise to the image latents.
-          4. Iteratively denoise the latents using the UNet.
-            At each timestep, intermediate UNet features (collected via hooks) are used
-            to compute a guidance edge map via the LEP network.
-            For early timesteps, the gradient of the similarity between the LEP output and 
-            the target edge map is used to adjust the latents.
-          5. The final latent is compared (via MSE loss) with the ground-truth latents.
+        Uses precomputed features from the dataset.
+        batch: dictionary with keys "gt_latent", "text_embedding", "encoded_edge_map"
         """
-        # 1. Encode ground-truth images into latents.
-        with torch.no_grad():
-            gt_latents = self.encode_to_latents(images)
+        # Retrieve precomputed tensors and move them to the training device if necessary.
+        gt_latents = batch["gt_latent"].to(self.device)        # shape: (1, ...)
         
-        # 2. Compute text embeddings. can chnage the text encode to use np "_"
-        final_text_embeddings = self.stable_diffusion_pipeline._encode_prompt(
-            prompt=text_prompts,
-            device=self.device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=True
-        )
         
-        # 3. Add noise to the image latents.
-        batch_size = images.shape[0]
+        final_text_embeddings = batch["text_embedding"]
+        if isinstance(final_text_embeddings, list):
+          final_text_embeddings = torch.cat(final_text_embeddings, dim=0)
+        if final_text_embeddings.dim() == 4 and final_text_embeddings.shape[0] == 1:
+            final_text_embeddings = final_text_embeddings[0, :, :, :]
+        #print("Precomputed text embedding shape after adjustment:", final_text_embeddings.shape)
+
+        encoded_edge_maps = batch["encoded_edge_map"].to(self.device)
+        #print(len(gt_latents),len(final_text_embeddings),len(encoded_edge_maps))
+        
+        # 3. Generate random noise and initialize latents.
+        batch_size = gt_latents.shape[0]
         noise = torch.randn(batch_size,
                             self.unet.config.in_channels,
                             self.unet.config.sample_size,
                             self.unet.config.sample_size).to(self.device)
-      
-        # 3.1 Apply diffuion fomrulea to combine image latents and noise
-        
-        # Random timestep for each sample
-        t = torch.randint(0, self.scheduler.config.num_train_timesteps, (batch_size,), device=self.device)
-        # Use the built-in noise addition method
-
-        latents= self.scheduler.add_noise(gt_latents, noise.half(), t)
-
-        if torch.isnan(latents).any():
-          print(f"part 1: {latents}")
-        # Save a clone for guidance computations.
+        latents = noise.half() * self.scheduler.init_noise_sigma
         noise_clone = latents.detach().clone()
         
-        # Set the scheduler timesteps (e.g., 12).
+        # Set the scheduler timesteps (e.g., 12)
         self.scheduler.set_timesteps(num_inference_timesteps)
-        
-        # Prepare edge maps from sketches (assumed to be working as before).
-        encoded_edge_maps = self.prepare_edge_maps(
-            prompt=text_prompts,
-            num_images_per_prompt=1,
-            edge_maps=sketches
-        )
-        print("Encoded edge maps norm:", torch.linalg.norm(encoded_edge_maps.float()).item())
         
         # 4. Iterative denoising loop.
         for i, timestep in enumerate(tqdm(self.scheduler.timesteps, desc="Denoising")):
@@ -222,20 +194,14 @@ class SketchGuidedText2ImageTrainer():
             # Duplicate latents for classifier-free guidance.
             unet_input = self.scheduler.scale_model_input(torch.cat([latents]*2), timestep).to(self.device)
             unet_input = unet_input.requires_grad_(True)
-            if torch.isnan(unet_input).any():
-             print(f"part 2:  NaN detected in Unet input")
+            
             # Forward pass through UNet.
             with current_gradient_state:
                 output = self.unet(unet_input, timestep, encoder_hidden_states=final_text_embeddings).sample
                 u, t = output.chunk(2)
-            if torch.isnan(output).any():
-              print(f"part 3: NaN detected in output")
             pred = u + classifier_guidance_strength * (t - u)
             latents_old = unet_input.chunk(2)[1]
             latents = self.scheduler.step(pred, timestep, latents).prev_sample
-            if torch.isnan(latents).any():
-             print(f"part 4:  NaN detected")
-
             # Guidance branch.
             with current_gradient_state:
                 intermediate_result = []
@@ -262,47 +228,28 @@ class SketchGuidedText2ImageTrainer():
                     similarity = torch.linalg.norm(result - encoded_edge_maps)**2
                     # Compute gradients from the similarity.
                     _, grad = torch.autograd.grad(similarity, unet_input, retain_graph=True)[0].chunk(2)
-                    
-                    """Remeberer This is for adpative scaling the eplislon here from 1e-4
-                    grad_norm = torch.linalg.norm(grad) + 1e-6  # Avoid division by zero
-                    scaling_factor = torch.sigmoid(grad_norm / 10)  # Adaptive scaling
-                    alpha = (torch.linalg.norm(latents_old - latents) / grad_norm) * sketch_guidance_strength * scaling_factor
-                    """
-                    alpha = (torch.linalg.norm(latents_old - latents)/torch.linalg.norm(grad))*sketch_guidance_strength
-                    latents = latents - alpha* grad
+                    grad_norm = torch.linalg.norm(grad)
+                    """Remeberer I chnaged the eplislon here to 1e-4"""
+                    grad_clamp = torch.clamp(grad, -1.0, 1.0)  # or use clip_grad_norm_
+                    alpha = (torch.linalg.norm(latents_old - latents) / (grad_norm + 1e-3)) * sketch_guidance_strength
+                    alpha = torch.clamp(alpha, max=0.05)  # cap alpha at 0.05
+                    latents = latents - alpha * grad_clamp
                     if torch.isnan(latents).any() or torch.isnan(grad).any():
                      print("NaN detected; skipping update or breaking.")
-                     #print("unet_input norm:", torch.linalg.norm(unet_input).item())
-                     #print("latents_old norm:", torch.linalg.norm(latents_old).item())
-                     #print("latents norm:", torch.linalg.norm(latents).item())
-                     #print("Encoded edge maps norm:", torch.linalg.norm(encoded_edge_maps.float()).item())
+                     print("unet_input norm:", torch.linalg.norm(unet_input).item())
+                     print("latents_old norm:", torch.linalg.norm(latents_old).item())
+                     print("latents norm:", torch.linalg.norm(latents).item())
+                     print("Encoded edge maps norm:", torch.linalg.norm(encoded_edge_maps.float()).item())
                     
                     print(f"Step {i} | timestep: {timestep} | alpha: {alpha.item():.4f}")
             
             gc.collect()
             torch.cuda.empty_cache()
-
-        # 5. Compute final MSE loss.
-        latentstoimage = self.latents_to_image(latents)
-        edges=self.latents_to_image(encoded_edge_maps)
-        for edge, image in zip(edges, latentstoimage):
-            fig, axs = plt.subplots(1, 2, figsize = (10, 5))
-            axs[0].imshow(edge)
-            axs[1].imshow(image)
-            axs[0].axis("off")
-            axs[1].axis("off")
-            axs[0].set_title("edge map")
-            axs[1].set_title(f"{text_prompts}")
-        plt.show()
-
         
-        guidance_loss = torch.linalg.norm(result - encoded_edge_maps) ** 2  
-        #mask = self.create_mask(images)  # Convert images into a mask
-        #loss = self.masked_mse_loss(latents, gt_latents, mask)
-
-        loss= F.mse_loss(latents, gt_latents)
+        # 5. Compute final MSE loss.
+        guidance_loss = torch.linalg.norm(result - encoded_edge_maps) ** 2   
+        loss = F.mse_loss(latents, gt_latents)
         return loss, guidance_loss
-                                    
                                     
     
     @torch.no_grad()
@@ -330,13 +277,6 @@ class SketchGuidedText2ImageTrainer():
         ).to(self.device)
         embeddings = self.text_encoder(tokenized.input_ids)[0]
         return embeddings.to(self.unet.dtype)
-
-    def compute_alphas_cumprod(self, scheduler):
-      timesteps = scheduler.num_train_timesteps
-      betas = torch.linspace(scheduler.beta_start, scheduler.beta_end, timesteps)
-      alphas = 1 - betas
-      alphas_cumprod = torch.cumprod(alphas, dim=0)
-      return alphas_cumprod
     
     def get_noise_level(self, noise, timesteps):
         """
@@ -349,19 +289,6 @@ class SketchGuidedText2ImageTrainer():
         noise_level = sqrt_one_minus_alpha_prod.to(self.device) * noise
         return noise_level
     
-    def create_mask(self, image, threshold=0.95):
-        """
-        Create a binary mask where white pixels (background) are 0 and everything else is 1.
-        Expects `image` to be a tensor of shape [B, C, H, W] with values in [0, 1].
-        """
-        # Convert RGB to grayscale by averaging across channels (assuming C=3)
-        grayscale = image.mean(dim=1, keepdim=True)  
-        mask = (grayscale < threshold).float()  
-        return mask
-    
-    def masked_mse_loss(self, pred, target, mask):
-        return F.mse_loss(pred * mask, target * mask)
-
     @torch.no_grad()
     def image_to_latents(self, img, img_type):
         """
@@ -425,7 +352,7 @@ class SketchGuidedText2ImageTrainer():
         images = (image * 255).round().astype("uint8")
         pil_images = [Image.fromarray(img) for img in images]
         return pil_images
-    
+
     @torch.no_grad()
     def evaluate_step(self, images, sketches, text_prompts, noise_scheduler, num_inference_timesteps=50):
         # 1. Encode ground-truth images into latents.
@@ -488,3 +415,162 @@ class SketchGuidedText2ImageTrainer():
         # Compute final loss.
         loss = F.mse_loss(latents, gt_latents)
         return loss
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+import numpy as np
+from PIL import Image
+
+class PrecomputedSketchDataset(Dataset):
+    def __init__(self, original_dataset, device, precompute_on_gpu,
+                 stable_diffusion_pipeline, unet, vae, text_encoder, lep_unet, tokenizer, sketch_simplifier):
+        """
+        original_dataset: your original dataset (e.g., an instance of SketchImageDataset)
+        device: the device to use for precomputation (e.g. 'cuda' or 'cpu')
+        precompute_on_gpu: if True, precompute on GPU; otherwise on CPU.
+        The remaining arguments are the pre-trained components used for feature extraction.
+        """
+        self.original_dataset = original_dataset
+        self.device = device if precompute_on_gpu else 'cpu'
+        
+        # Save the components in the instance.
+        self.stable_diffusion_pipeline = stable_diffusion_pipeline
+        self.unet = unet      # move UNet to CPU
+        self.vae = vae       # move VAE to CPU
+        self.text_encoder = text_encoder  # move text encoder to CPU
+        self.lep_unet = lep_unet
+        self.tokenizer = tokenizer 
+        
+        self.precomputed = []
+        print("Precomputing features for dataset...")
+        for idx in range(len(original_dataset)):
+            sample = original_dataset[idx]
+            with torch.no_grad():
+                # Precompute ground-truth latent (VAE encoding)
+                # Ensure the image tensor has a batch dimension
+                gt_latent = self.encode_to_latents(sample["image"].unsqueeze(0)).cpu()
+                
+                # Precompute text embedding
+                text_embedding = self.stable_diffusion_pipeline._encode_prompt(
+                    prompt=[sample["text_prompt"]],
+                    device=self.device,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=True
+                ).cpu()
+                
+                # Precompute the encoded edge map from the sketch
+                encoded_edge_map = self.prepare_edge_maps(
+                    prompt=[sample["text_prompt"]],
+                    num_images_per_prompt=1,
+                    edge_maps=[sample["sketch"]]
+                ).cpu()
+            
+            self.precomputed.append({
+                "gt_latent": gt_latent,
+                "text_embedding": text_embedding,
+                "encoded_edge_map": encoded_edge_map,
+                # Optionally, store additional info (e.g., filename, raw image) if needed.
+            })
+        print("Precomputation complete. Precomputed dataset size:", len(self.precomputed))
+    
+    def __len__(self):
+        return len(self.precomputed)
+    
+    def __getitem__(self, idx):
+        return self.precomputed[idx]
+    
+    @torch.no_grad()
+    def prepare_edge_maps(self, prompt, num_images_per_prompt, edge_maps):
+        batch_size = len(prompt)
+        size = 512
+        if batch_size != len(edge_maps):
+            raise ValueError("Wrong number of edge maps")
+        
+        processed_edge_maps = []
+        for edge_map in edge_maps:
+            arr = np.array(edge_map)
+            # Invert the sketch: if grayscale, invert directly; if color, take the first 3 channels
+            if arr.ndim == 2:
+                inverted = 255 - arr
+            else:
+                inverted = 255 - arr[:, :, :3]
+            processed_img = Image.fromarray(inverted).resize((size, size))
+            processed_edge_maps.append(processed_img)
+        
+        # Encode each processed edge map into a latent representation.
+        encoded_edge_maps = [self.image_to_latents(edge.resize((size, size)), img_type="edge_map")
+                             for edge in processed_edge_maps]
+        # If needed, repeat each edge map (num_images_per_prompt times)
+        encoded_edge_maps_final = [edge for edge in encoded_edge_maps for _ in range(num_images_per_prompt)]
+        encoded_edge_maps_tensor = torch.cat(encoded_edge_maps_final, dim=0)
+        return encoded_edge_maps_tensor
+    
+    @torch.no_grad()
+    def encode_to_latents(self, images):
+        """
+        Encodes image tensors (with pixel values in [0,1]) into latent representations using the frozen VAE.
+        """
+        images = images.to(self.vae.dtype)
+        images = images * 2 - 1  # Normalize to [-1, 1]
+        latents = self.vae.encode(images).latent_dist.sample()
+        latents = latents * 0.18215
+        return latents
+    
+    @torch.no_grad()
+    def text_to_embeddings(self, text):
+        """
+        Converts text prompts to embeddings using the tokenizer and text encoder.
+        """
+        tokenized = self.tokenizer(
+            text,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt"
+        ).to(self.device)
+        embeddings = self.text_encoder(tokenized.input_ids)[0]
+        return embeddings.to(self.unet.dtype)
+    
+    def get_noise_level(self, noise, timesteps):
+        """
+        Computes a noise level tensor based on the scheduler's alphas_cumprod.
+        """
+        sqrt_one_minus_alpha_prod = (1 - self.scheduler.alphas_cumprod[timesteps]) ** 0.5
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+        while len(sqrt_one_minus_alpha_prod.shape) < len(noise.shape):
+            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+        noise_level = sqrt_one_minus_alpha_prod.to(self.device) * noise
+        return noise_level
+    
+    @torch.no_grad()
+    def image_to_latents(self, img, img_type):
+        """
+        Converts a PIL image to a latent representation using the frozen VAE.
+        If img_type is "edge_map", binarize the image.
+        """
+        np_img = np.array(img).astype(np.float16) / 255.0
+        if img_type == "edge_map":
+            np_img[np_img < 0.5] = 0.
+            np_img[np_img >= 0.5] = 1.
+        np_img = np_img * 2.0 - 1.0
+        if np_img.ndim == 2:
+            np_img = np.expand_dims(np_img, axis=-1)  # shape (H, W, 1)
+        np_img = np_img[None].transpose(0, 3, 1, 2)   # shape (1, C, H, W)
+        torch_img = torch.from_numpy(np_img)
+        generator = torch.Generator(self.device).manual_seed(0)
+        latents = self.vae.encode(torch_img.to(self.vae.dtype).to(self.device)).latent_dist.sample(generator=generator)
+        latents = latents * 0.18215
+        return latents
+
+        # If the image is grayscale (2D), add a channel dimension.
+        if np_img.ndim == 2:
+            np_img = np.expand_dims(np_img, axis=-1)  # shape becomes (H, W, 1)
+        # Now add the batch dimension and transpose to NCHW format.
+        np_img = np_img[None].transpose(0, 3, 1, 2)  # shape becomes (1, C, H, W)
+        torch_img = torch.from_numpy(np_img)
+        generator = torch.Generator(self.device).manual_seed(0)
+        latents = self.vae.encode(torch_img.to(self.vae.dtype).to(self.device)).latent_dist.sample(generator=generator)
+        latents = latents * 0.18215
+        return latents
+
